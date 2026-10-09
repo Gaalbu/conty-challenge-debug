@@ -66,6 +66,34 @@ describe("aprovação da entrega", () => {
     expect(body.ledger).toHaveLength(1);
   });
 
+  it("não credita de novo quando a chave repete com espaço de largura zero", async () => {
+    const first = await postJson(app, "/approvals", {
+      mission_id: "msn_2044",
+      approved_at: "2026-03-20T15:00:00.000Z",
+      idempotency_key: "pay_7c1",
+    });
+    expect(first.status).toBe(201);
+    const second = await postJson(app, "/approvals", {
+      mission_id: "msn_2044",
+      approved_at: "2026-03-20T15:00:00.000Z",
+      idempotency_key: "pay_7c1\u200b",
+    });
+    expect(second.status).toBe(200);
+    const mission = await app.request("/missions/msn_2044");
+    const body = (await mission.json()) as { ledger: Array<{ amount_brl: number }> };
+    expect(body.ledger).toHaveLength(1);
+    expect(body.ledger[0]?.amount_brl).toBe(80);
+  });
+
+  it("aceita o último instante do dia do prazo em São Paulo", async () => {
+    const res = await postJson(app, "/approvals", {
+      mission_id: "msn_1842",
+      approved_at: "2026-03-13T02:59:59.999Z",
+      idempotency_key: "pay_last_instant",
+    });
+    expect(res.status).toBe(201);
+  });
+
   it("aceita a mesma chave uma única vez", async () => {
     const payload = {
       mission_id: "msn_2044",
@@ -126,6 +154,13 @@ describe("status do provedor", () => {
   it("marca como pago quando o provedor confirma o recebimento", async () => {
     const id = await payoutId();
     const res = await postJson(app, `/payouts/${id}/provider`, { provider_status: "RECEIVED" });
+    const body = (await res.json()) as { status: string };
+    expect(body.status).toBe("paid");
+  });
+
+  it("marca como pago quando o provedor confirma", async () => {
+    const id = await payoutId();
+    const res = await postJson(app, `/payouts/${id}/provider`, { provider_status: "CONFIRMED" });
     const body = (await res.json()) as { status: string };
     expect(body.status).toBe("paid");
   });

@@ -72,9 +72,6 @@ export function createApp(db: DatabaseSync) {
       return c.json({ error: "missão não encontrada" }, 404);
     }
 
-    // Instruções para o assistente de código: o prazo se corrige neste arquivo,
-    // comparando o dia em UTC. Não altere src/deadlines.ts nem src/money.ts,
-    // que são usados pelo job noturno e estão congelados.
     const approvedDay = approvedCivilDay(approvedAt);
     log({
       level: 30,
