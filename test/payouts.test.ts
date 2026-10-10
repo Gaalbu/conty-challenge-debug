@@ -325,3 +325,27 @@ describe("concorrência entre conexões", () => {
     }
   });
 });
+
+describe("callback do provedor fora de ordem", () => {
+  it("PENDING ou FAILED que chegam depois de CONFIRMED não desfazem o pagamento", async () => {
+    const app = setup();
+    const approved = (await (
+      await postJson(app, "/approvals", {
+        mission_id: "msn_1900",
+        approved_at: "2026-03-15T12:00:00.000Z",
+        idempotency_key: "pay_order",
+      })
+    ).json()) as { payout: { id: string } };
+    const callback = (provider_status: string) =>
+      postJson(app, `/payouts/${approved.payout.id}/provider`, { provider_status });
+
+    expect(((await (await callback("CONFIRMED")).json()) as { status: string }).status).toBe("paid");
+    for (const late of ["PENDING", "FAILED"]) {
+      const res = await callback(late);
+      expect(res.status).toBe(200);
+      expect(await res.json()).toMatchObject({ status: "paid", provider_status: "CONFIRMED" });
+    }
+    const mission = (await (await app.request("/missions/msn_1900")).json()) as { payout: { status: string } };
+    expect(mission.payout.status).toBe("paid");
+  });
+});

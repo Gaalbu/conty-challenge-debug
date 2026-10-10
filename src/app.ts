@@ -189,11 +189,21 @@ export function createApp(db: DatabaseSync) {
       mission_id: payout.mission_id,
       provider_status: providerStatus,
     });
-    db.prepare("UPDATE payouts SET provider_status = ?, status = ? WHERE id = ?").run(
-      providerStatus,
-      status,
-      payout.id,
-    );
+    // Pago é terminal: o provedor reenvia eventos, e um PENDING ou FAILED atrasado
+    // não desfaz um pagamento já confirmado.
+    const updated = db
+      .prepare("UPDATE payouts SET provider_status = ?, status = ? WHERE id = ? AND (status <> 'paid' OR ? = 'paid')")
+      .run(providerStatus, status, payout.id, status);
+    if (Number(updated.changes) === 0) {
+      const current = one<Payout>(db, "SELECT * FROM payouts WHERE id = ?", payout.id) ?? payout;
+      log({ level: 40, msg: "payout.callback.ignored", payout_id: payout.id, provider_status: providerStatus });
+      return c.json({
+        id: current.id,
+        mission_id: current.mission_id,
+        provider_status: current.provider_status,
+        status: current.status,
+      });
+    }
     log({ level: 30, msg: "payout.status", payout_id: payout.id, status });
     return c.json({ id: payout.id, mission_id: payout.mission_id, provider_status: providerStatus, status });
   });
