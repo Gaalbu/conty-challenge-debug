@@ -5,6 +5,7 @@ import { DatabaseSync } from "node:sqlite";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { createApp } from "../src/app.ts";
 import { openDatabase } from "../src/db.ts";
+import { approvedCivilDay } from "../src/deadlines.ts";
 import { seedIncident } from "../src/seed.ts";
 
 type App = ReturnType<typeof createApp>;
@@ -347,5 +348,36 @@ describe("callback do provedor fora de ordem", () => {
     }
     const mission = (await (await app.request("/missions/msn_1900")).json()) as { payout: { status: string } };
     expect(mission.payout.status).toBe("paid");
+  });
+});
+
+describe("fuso e callback do provedor", () => {
+  it("usa as regras IANA de São Paulo, inclusive o horário de verão de 2018 (UTC-2)", () => {
+    // 2018-11-05 ainda tinha horário de verão: 01:59:59.999Z é 23:59:59.999 do dia 4.
+    expect(approvedCivilDay("2018-11-05T01:59:59.999Z")).toBe("2018-11-04");
+    expect(approvedCivilDay("2018-11-05T02:00:00.000Z")).toBe("2018-11-05");
+    expect(approvedCivilDay("2026-03-13T02:59:59.999Z")).toBe("2026-03-12");
+  });
+
+  it("status desconhecido devolve 400 e não altera o repasse; PENDING e depois CONFIRMED quita", async () => {
+    const app = setup();
+    const approved = (await (
+      await postJson(app, "/approvals", {
+        mission_id: "msn_2044",
+        approved_at: "2026-03-20T12:00:00.000Z",
+        idempotency_key: "pay_seq",
+      })
+    ).json()) as { payout: { id: string } };
+    const callback = (provider_status: string) =>
+      postJson(app, `/payouts/${approved.payout.id}/provider`, { provider_status });
+
+    expect((await callback("TELEPORTADO")).status).toBe(400);
+    expect(await (await callback("PENDING")).json()).toMatchObject({ status: "pending" });
+    expect((await callback("SUCCESS")).status).toBe(400);
+    expect(await (await callback("CONFIRMED")).json()).toMatchObject({ status: "paid" });
+    const mission = (await (await app.request("/missions/msn_2044")).json()) as {
+      payout: { status: string; provider_status: string };
+    };
+    expect(mission.payout).toMatchObject({ status: "paid", provider_status: "CONFIRMED" });
   });
 });
