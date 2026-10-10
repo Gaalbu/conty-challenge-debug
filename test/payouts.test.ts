@@ -208,4 +208,24 @@ describe("integridade do crédito", () => {
     const body = (await (await app.request("/missions/msn_1842")).json()) as { ledger: unknown[] };
     expect(body.ledger).toHaveLength(1);
   });
+
+  it("falha no repasse desfaz o crédito e o retry com a mesma chave credita uma vez", async () => {
+    const db = openDatabase(":memory:");
+    seedIncident(db);
+    const failing = createApp(db);
+    db.exec(`CREATE TRIGGER fail_payout BEFORE INSERT ON payouts BEGIN SELECT RAISE(ABORT, 'falha simulada'); END;`);
+
+    expect((await postJson(failing, "/approvals", approval("msn_1842", "pay_retry"))).status).toBe(500);
+    const after = (await (await failing.request("/missions/msn_1842")).json()) as {
+      mission: { status: string };
+      ledger: unknown[];
+    };
+    expect(after.ledger).toHaveLength(0);
+    expect(after.mission.status).toBe("open");
+
+    db.exec("DROP TRIGGER fail_payout");
+    expect((await postJson(failing, "/approvals", approval("msn_1842", "pay_retry"))).status).toBe(201);
+    const done = (await (await failing.request("/missions/msn_1842")).json()) as { ledger: unknown[] };
+    expect(done.ledger).toHaveLength(1);
+  });
 });

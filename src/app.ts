@@ -115,9 +115,30 @@ export function createApp(db: DatabaseSync) {
       amount_brl: reaisFromCents(mission.amount_cents),
       created_at: new Date().toISOString(),
     };
-    db.prepare(
-      "INSERT INTO ledger (id, mission_id, idempotency_key, amount_brl, created_at) VALUES (?, ?, ?, ?, ?)",
-    ).run(ledger.id, ledger.mission_id, ledger.idempotency_key, ledger.amount_brl, ledger.created_at);
+    // Crédito, repasse e status da missão entram juntos ou nenhum entra.
+    let payout = one<Payout>(db, "SELECT * FROM payouts WHERE mission_id = ?", mission.id);
+    db.exec("BEGIN IMMEDIATE");
+    try {
+      db.prepare(
+        "INSERT INTO ledger (id, mission_id, idempotency_key, amount_brl, created_at) VALUES (?, ?, ?, ?, ?)",
+      ).run(ledger.id, ledger.mission_id, ledger.idempotency_key, ledger.amount_brl, ledger.created_at);
+      if (!payout) {
+        payout = {
+          id: crypto.randomUUID(),
+          mission_id: mission.id,
+          provider_status: null,
+          status: "pending",
+        };
+        db.prepare(
+          "INSERT INTO payouts (id, mission_id, provider_status, status) VALUES (?, ?, ?, ?)",
+        ).run(payout.id, payout.mission_id, payout.provider_status, payout.status);
+      }
+      db.prepare("UPDATE missions SET status = 'approved' WHERE id = ?").run(mission.id);
+      db.exec("COMMIT");
+    } catch (error) {
+      db.exec("ROLLBACK");
+      throw error;
+    }
     log({
       level: 30,
       msg: "ledger.credit",
@@ -125,21 +146,6 @@ export function createApp(db: DatabaseSync) {
       idempotency_key: key,
       amount_brl: ledger.amount_brl.toFixed(2),
     });
-
-    let payout = one<Payout>(db, "SELECT * FROM payouts WHERE mission_id = ?", mission.id);
-    if (!payout) {
-      payout = {
-        id: crypto.randomUUID(),
-        mission_id: mission.id,
-        provider_status: null,
-        status: "pending",
-      };
-      db.prepare(
-        "INSERT INTO payouts (id, mission_id, provider_status, status) VALUES (?, ?, ?, ?)",
-      ).run(payout.id, payout.mission_id, payout.provider_status, payout.status);
-    }
-
-    db.prepare("UPDATE missions SET status = 'approved' WHERE id = ?").run(mission.id);
     return c.json({ mission_id: mission.id, status: "approved", ledger, payout }, 201);
   });
 
