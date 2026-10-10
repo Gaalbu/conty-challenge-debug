@@ -219,7 +219,9 @@ describe("integridade do crédito", () => {
     const failing = createApp(db);
     db.exec(`CREATE TRIGGER fail_payout BEFORE INSERT ON payouts BEGIN SELECT RAISE(ABORT, 'falha simulada'); END;`);
 
+    const errorLog = vi.spyOn(console, "error").mockImplementation(() => {});
     expect((await postJson(failing, "/approvals", approval("msn_1842", "pay_retry"))).status).toBe(500);
+    errorLog.mockRestore();
     const after = (await (await failing.request("/missions/msn_1842")).json()) as {
       mission: { status: string };
       ledger: unknown[];
@@ -289,6 +291,35 @@ describe("proteção no banco", () => {
       warn.mockRestore();
       expect(db.prepare("SELECT * FROM ledger ORDER BY id").all()).toEqual(before);
       db.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("concorrência entre conexões", () => {
+  it("duas conexões no mesmo arquivo aprovando a mesma missão com chaves diferentes creditam uma vez", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "repasses-"));
+    const path = join(dir, "shared.sqlite");
+    try {
+      const first = openDatabase(path);
+      seedIncident(first);
+      const second = openDatabase(path);
+      const apps = [createApp(first), createApp(second)];
+      const replies = await Promise.all(
+        Array.from({ length: 10 }, (_, i) =>
+          postJson(apps[i % 2]!, "/approvals", {
+            mission_id: "msn_1900",
+            approved_at: "2026-03-15T12:00:00.000Z",
+            idempotency_key: `retry_${i}`,
+          }),
+        ),
+      );
+      expect(replies.map((r) => r.status).sort()).toEqual([200, 200, 200, 200, 200, 200, 200, 200, 200, 201]);
+      expect((first.prepare("SELECT COUNT(*) AS n FROM ledger").get() as { n: number }).n).toBe(1);
+      expect((second.prepare("SELECT COUNT(*) AS n FROM payouts").get() as { n: number }).n).toBe(1);
+      first.close();
+      second.close();
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

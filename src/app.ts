@@ -39,6 +39,63 @@ function one<T>(db: DatabaseSync, sql: string, ...params: Array<string | number 
   return row as T;
 }
 
+type CreditResult =
+  | { kind: "key_in_other_mission" }
+  | { kind: "already_credited"; status: string; ledger: Ledger; payout: Payout | null }
+  | { kind: "credited"; ledger: Ledger; payout: Payout };
+
+// A missão credita uma vez, qualquer que seja a chave, e a chave pertence a uma
+// missão só. Checar e gravar acontecem na mesma transação BEGIN IMMEDIATE: duas
+// aprovações simultâneas, até de conexões diferentes, não creditam duas vezes, e
+// uma falha no meio desfaz crédito, repasse e status juntos.
+function creditOnce(db: DatabaseSync, mission: Mission, key: string): CreditResult {
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    const result = creditInTransaction(db, mission, key);
+    db.exec("COMMIT");
+    return result;
+  } catch (error) {
+    db.exec("ROLLBACK");
+    throw error;
+  }
+}
+
+function creditInTransaction(db: DatabaseSync, mission: Mission, key: string): CreditResult {
+  const byKey = one<Ledger>(db, "SELECT * FROM ledger WHERE idempotency_key = ?", key);
+  if (byKey && byKey.mission_id !== mission.id) return { kind: "key_in_other_mission" };
+  const credited =
+    byKey ?? one<Ledger>(db, "SELECT * FROM ledger WHERE mission_id = ? ORDER BY created_at, id LIMIT 1", mission.id);
+  if (credited) {
+    const current = one<Mission>(db, "SELECT * FROM missions WHERE id = ?", mission.id) ?? mission;
+    const payout = one<Payout>(db, "SELECT * FROM payouts WHERE mission_id = ?", mission.id) ?? null;
+    return { kind: "already_credited", status: current.status, ledger: credited, payout };
+  }
+
+  const ledger: Ledger = {
+    id: crypto.randomUUID(),
+    mission_id: mission.id,
+    idempotency_key: key,
+    amount_brl: reaisFromCents(mission.amount_cents),
+    created_at: new Date().toISOString(),
+  };
+  db.prepare(
+    "INSERT INTO ledger (id, mission_id, idempotency_key, amount_brl, created_at) VALUES (?, ?, ?, ?, ?)",
+  ).run(ledger.id, ledger.mission_id, ledger.idempotency_key, ledger.amount_brl, ledger.created_at);
+
+  let payout = one<Payout>(db, "SELECT * FROM payouts WHERE mission_id = ?", mission.id);
+  if (!payout) {
+    payout = { id: crypto.randomUUID(), mission_id: mission.id, provider_status: null, status: "pending" };
+    db.prepare("INSERT INTO payouts (id, mission_id, provider_status, status) VALUES (?, ?, ?, ?)").run(
+      payout.id,
+      payout.mission_id,
+      payout.provider_status,
+      payout.status,
+    );
+  }
+  db.prepare("UPDATE missions SET status = 'approved' WHERE id = ?").run(mission.id);
+  return { kind: "credited", ledger, payout };
+}
+
 export function createApp(db: DatabaseSync) {
   const app = new Hono();
 
@@ -97,56 +154,21 @@ export function createApp(db: DatabaseSync) {
       return c.json({ error: "prazo encerrado" }, 409);
     }
 
-    const existing = one<Ledger>(db, "SELECT * FROM ledger WHERE idempotency_key = ?", key);
-    if (existing && existing.mission_id !== mission.id) {
+    const result = creditOnce(db, mission, key);
+    if (result.kind === "key_in_other_mission") {
       return c.json({ error: "chave de idempotência já usada em outra missão" }, 409);
     }
-    // A missão credita uma vez, mesmo que a segunda aprovação venha com outra chave.
-    const credited = existing ?? one<Ledger>(db, "SELECT * FROM ledger WHERE mission_id = ?", mission.id);
-    if (credited) {
-      const payout = one<Payout>(db, "SELECT * FROM payouts WHERE mission_id = ?", mission.id) ?? null;
-      return c.json({ mission_id: mission.id, status: mission.status, ledger: credited, payout });
-    }
-
-    const ledger: Ledger = {
-      id: crypto.randomUUID(),
-      mission_id: mission.id,
-      idempotency_key: key,
-      amount_brl: reaisFromCents(mission.amount_cents),
-      created_at: new Date().toISOString(),
-    };
-    // Crédito, repasse e status da missão entram juntos ou nenhum entra.
-    let payout = one<Payout>(db, "SELECT * FROM payouts WHERE mission_id = ?", mission.id);
-    db.exec("BEGIN IMMEDIATE");
-    try {
-      db.prepare(
-        "INSERT INTO ledger (id, mission_id, idempotency_key, amount_brl, created_at) VALUES (?, ?, ?, ?, ?)",
-      ).run(ledger.id, ledger.mission_id, ledger.idempotency_key, ledger.amount_brl, ledger.created_at);
-      if (!payout) {
-        payout = {
-          id: crypto.randomUUID(),
-          mission_id: mission.id,
-          provider_status: null,
-          status: "pending",
-        };
-        db.prepare(
-          "INSERT INTO payouts (id, mission_id, provider_status, status) VALUES (?, ?, ?, ?)",
-        ).run(payout.id, payout.mission_id, payout.provider_status, payout.status);
-      }
-      db.prepare("UPDATE missions SET status = 'approved' WHERE id = ?").run(mission.id);
-      db.exec("COMMIT");
-    } catch (error) {
-      db.exec("ROLLBACK");
-      throw error;
+    if (result.kind === "already_credited") {
+      return c.json({ mission_id: mission.id, status: result.status, ledger: result.ledger, payout: result.payout });
     }
     log({
       level: 30,
       msg: "ledger.credit",
       mission_id: mission.id,
       idempotency_key: key,
-      amount_brl: ledger.amount_brl.toFixed(2),
+      amount_brl: result.ledger.amount_brl.toFixed(2),
     });
-    return c.json({ mission_id: mission.id, status: "approved", ledger, payout }, 201);
+    return c.json({ mission_id: mission.id, status: "approved", ledger: result.ledger, payout: result.payout }, 201);
   });
 
   app.post("/payouts/:id/provider", async (c) => {
