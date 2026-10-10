@@ -59,7 +59,9 @@ export function createApp(db: DatabaseSync) {
     const missionId = typeof record.mission_id === "string" ? record.mission_id : "";
     const approvedAt = typeof record.approved_at === "string" ? record.approved_at : "";
     const rawKey = typeof record.idempotency_key === "string" ? record.idempotency_key : "";
-    if (!missionId || !approvedAt || !rawKey) {
+    // A chave é validada depois de normalizada: só espaço ou caractere invisível vira "".
+    const key = normalizeKey(rawKey);
+    if (!missionId || !approvedAt || !key) {
       return c.json({ error: "missão, data de aprovação e chave são obrigatórias" }, 400);
     }
     if (Number.isNaN(new Date(approvedAt).getTime())) {
@@ -95,7 +97,6 @@ export function createApp(db: DatabaseSync) {
       return c.json({ error: "prazo encerrado" }, 409);
     }
 
-    const key = normalizeKey(rawKey);
     const existing = one<Ledger>(db, "SELECT * FROM ledger WHERE idempotency_key = ?", key);
     if (existing) {
       const payout = one<Payout>(db, "SELECT * FROM payouts WHERE mission_id = ?", mission.id) ?? null;

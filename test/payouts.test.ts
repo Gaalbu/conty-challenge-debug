@@ -172,3 +172,25 @@ describe("status do provedor", () => {
     expect(body.status).toBe("failed");
   });
 });
+
+describe("integridade do crédito", () => {
+  let app: App;
+
+  beforeEach(() => {
+    app = setup();
+  });
+
+  const approval = (mission_id: string, idempotency_key: string) => ({
+    mission_id,
+    approved_at: "2026-03-12T15:00:00.000Z",
+    idempotency_key,
+  });
+
+  it("recusa chave que fica vazia depois de normalizar, sem gravar crédito", async () => {
+    for (const key of ["​", "‌", "   ", " "]) {
+      expect((await postJson(app, "/approvals", approval("msn_1842", key))).status).toBe(400);
+    }
+    const body = (await (await app.request("/missions/msn_1842")).json()) as { ledger: unknown[] };
+    expect(body.ledger).toHaveLength(0);
+  });
+});
