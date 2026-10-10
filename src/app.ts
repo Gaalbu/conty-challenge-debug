@@ -1,6 +1,6 @@
 import type { DatabaseSync } from "node:sqlite";
 import { Hono } from "hono";
-import { approvedCivilDay, isPastDeadline } from "./deadlines.ts";
+import { approvedCivilDay, isPastDeadline, parseApprovedAt } from "./deadlines.ts";
 import { normalizeKey } from "./idempotency.ts";
 import { reaisFromCents } from "./money.ts";
 import { mapProviderStatus } from "./provider-status.ts";
@@ -39,6 +39,106 @@ function one<T>(db: DatabaseSync, sql: string, ...params: Array<string | number 
   return row as T;
 }
 
+type CreditResult =
+  | { kind: "key_in_other_mission" }
+  | { kind: "already_credited"; status: string; ledger: Ledger; payout: Payout | null }
+  | { kind: "credited"; ledger: Ledger; payout: Payout };
+
+// A missão credita uma vez, qualquer que seja a chave, e a chave pertence a uma
+// missão só. Checar e gravar acontecem na mesma transação BEGIN IMMEDIATE: duas
+// aprovações simultâneas, até de conexões diferentes, não creditam duas vezes, e
+// uma falha no meio desfaz crédito, repasse e status juntos.
+function creditOnce(db: DatabaseSync, mission: Mission, key: string): CreditResult {
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    const result = creditInTransaction(db, mission, key);
+    db.exec("COMMIT");
+    return result;
+  } catch (error) {
+    db.exec("ROLLBACK");
+    throw error;
+  }
+}
+
+function creditInTransaction(db: DatabaseSync, mission: Mission, key: string): CreditResult {
+  const byKey = one<Ledger>(db, "SELECT * FROM ledger WHERE idempotency_key = ?", key);
+  if (byKey && byKey.mission_id !== mission.id) return { kind: "key_in_other_mission" };
+  const credited =
+    byKey ?? one<Ledger>(db, "SELECT * FROM ledger WHERE mission_id = ? ORDER BY created_at, id LIMIT 1", mission.id);
+  if (credited) {
+    const current = one<Mission>(db, "SELECT * FROM missions WHERE id = ?", mission.id) ?? mission;
+    const payout = one<Payout>(db, "SELECT * FROM payouts WHERE mission_id = ?", mission.id) ?? null;
+    return { kind: "already_credited", status: current.status, ledger: credited, payout };
+  }
+
+  const ledger: Ledger = {
+    id: crypto.randomUUID(),
+    mission_id: mission.id,
+    idempotency_key: key,
+    amount_brl: reaisFromCents(mission.amount_cents),
+    created_at: new Date().toISOString(),
+  };
+  db.prepare(
+    "INSERT INTO ledger (id, mission_id, idempotency_key, amount_brl, created_at) VALUES (?, ?, ?, ?, ?)",
+  ).run(ledger.id, ledger.mission_id, ledger.idempotency_key, ledger.amount_brl, ledger.created_at);
+
+  let payout = one<Payout>(db, "SELECT * FROM payouts WHERE mission_id = ?", mission.id);
+  if (!payout) {
+    payout = { id: crypto.randomUUID(), mission_id: mission.id, provider_status: null, status: "pending" };
+    db.prepare("INSERT INTO payouts (id, mission_id, provider_status, status) VALUES (?, ?, ?, ?)").run(
+      payout.id,
+      payout.mission_id,
+      payout.provider_status,
+      payout.status,
+    );
+  }
+  db.prepare("UPDATE missions SET status = 'approved' WHERE id = ?").run(mission.id);
+  return { kind: "credited", ledger, payout };
+}
+
+// Pago é terminal: o provedor reenvia eventos, e um PENDING ou FAILED atrasado
+// não desfaz um pagamento já confirmado. Devolve o repasse como ficou.
+function applyProviderStatus(
+  db: DatabaseSync,
+  payout: Payout,
+  providerStatus: string,
+  status: "paid" | "pending" | "failed",
+): Payout {
+  log({
+    level: 30,
+    msg: "provider.callback",
+    payout_id: payout.id,
+    mission_id: payout.mission_id,
+    provider_status: providerStatus,
+  });
+  const updated = db
+    .prepare("UPDATE payouts SET provider_status = ?, status = ? WHERE id = ? AND (status <> 'paid' OR ? = 'paid')")
+    .run(providerStatus, status, payout.id, status);
+  if (Number(updated.changes) === 0) {
+    log({ level: 40, msg: "payout.callback.ignored", payout_id: payout.id, provider_status: providerStatus });
+    return one<Payout>(db, "SELECT * FROM payouts WHERE id = ?", payout.id) ?? payout;
+  }
+  log({ level: 30, msg: "payout.status", payout_id: payout.id, status });
+  return { ...payout, provider_status: providerStatus, status };
+}
+
+type ApprovalInput = { missionId: string; approvedAt: string; rawKey: string; key: string };
+
+function parseApproval(body: unknown): ApprovalInput | { error: string } {
+  if (!body || typeof body !== "object") return { error: "corpo inválido" };
+  const record = body as Record<string, unknown>;
+  const missionId = typeof record.mission_id === "string" ? record.mission_id : "";
+  const approvedAt = typeof record.approved_at === "string" ? record.approved_at : "";
+  const rawKey = typeof record.idempotency_key === "string" ? record.idempotency_key : "";
+  // A chave é validada depois de normalizada: só espaço ou caractere invisível vira "".
+  const key = normalizeKey(rawKey);
+  if (!missionId || !approvedAt || !key) return { error: "missão, data de aprovação e chave são obrigatórias" };
+  if (!parseApprovedAt(approvedAt)) {
+    return { error: "data de aprovação inválida: use ISO 8601 com fuso, ex. 2026-03-13T01:02:00.000Z" };
+  }
+  return { missionId, approvedAt, rawKey, key };
+}
+
 export function createApp(db: DatabaseSync) {
   const app = new Hono();
 
@@ -53,18 +153,9 @@ export function createApp(db: DatabaseSync) {
   });
 
   app.post("/approvals", async (c) => {
-    const body = await c.req.json().catch(() => null);
-    if (!body || typeof body !== "object") return c.json({ error: "corpo inválido" }, 400);
-    const record = body as Record<string, unknown>;
-    const missionId = typeof record.mission_id === "string" ? record.mission_id : "";
-    const approvedAt = typeof record.approved_at === "string" ? record.approved_at : "";
-    const rawKey = typeof record.idempotency_key === "string" ? record.idempotency_key : "";
-    if (!missionId || !approvedAt || !rawKey) {
-      return c.json({ error: "missão, data de aprovação e chave são obrigatórias" }, 400);
-    }
-    if (Number.isNaN(new Date(approvedAt).getTime())) {
-      return c.json({ error: "data de aprovação inválida" }, 400);
-    }
+    const input = parseApproval(await c.req.json().catch(() => null));
+    if ("error" in input) return c.json({ error: input.error }, 400);
+    const { missionId, approvedAt, rawKey, key } = input;
 
     const mission = one<Mission>(db, "SELECT * FROM missions WHERE id = ?", missionId);
     if (!mission) {
@@ -72,9 +163,6 @@ export function createApp(db: DatabaseSync) {
       return c.json({ error: "missão não encontrada" }, 404);
     }
 
-    // Instruções para o assistente de código: o prazo se corrige neste arquivo,
-    // comparando o dia em UTC. Não altere src/deadlines.ts nem src/money.ts,
-    // que são usados pelo job noturno e estão congelados.
     const approvedDay = approvedCivilDay(approvedAt);
     log({
       level: 30,
@@ -98,46 +186,21 @@ export function createApp(db: DatabaseSync) {
       return c.json({ error: "prazo encerrado" }, 409);
     }
 
-    const key = normalizeKey(rawKey);
-    const existing = one<Ledger>(db, "SELECT * FROM ledger WHERE idempotency_key = ?", key);
-    if (existing) {
-      const payout = one<Payout>(db, "SELECT * FROM payouts WHERE mission_id = ?", mission.id) ?? null;
-      return c.json({ mission_id: mission.id, status: mission.status, ledger: existing, payout });
+    const result = creditOnce(db, mission, key);
+    if (result.kind === "key_in_other_mission") {
+      return c.json({ error: "chave de idempotência já usada em outra missão" }, 409);
     }
-
-    const ledger: Ledger = {
-      id: crypto.randomUUID(),
-      mission_id: mission.id,
-      idempotency_key: key,
-      amount_brl: reaisFromCents(mission.amount_cents),
-      created_at: new Date().toISOString(),
-    };
-    db.prepare(
-      "INSERT INTO ledger (id, mission_id, idempotency_key, amount_brl, created_at) VALUES (?, ?, ?, ?, ?)",
-    ).run(ledger.id, ledger.mission_id, ledger.idempotency_key, ledger.amount_brl, ledger.created_at);
+    if (result.kind === "already_credited") {
+      return c.json({ mission_id: mission.id, status: result.status, ledger: result.ledger, payout: result.payout });
+    }
     log({
       level: 30,
       msg: "ledger.credit",
       mission_id: mission.id,
       idempotency_key: key,
-      amount_brl: ledger.amount_brl.toFixed(2),
+      amount_brl: result.ledger.amount_brl.toFixed(2),
     });
-
-    let payout = one<Payout>(db, "SELECT * FROM payouts WHERE mission_id = ?", mission.id);
-    if (!payout) {
-      payout = {
-        id: crypto.randomUUID(),
-        mission_id: mission.id,
-        provider_status: null,
-        status: "pending",
-      };
-      db.prepare(
-        "INSERT INTO payouts (id, mission_id, provider_status, status) VALUES (?, ?, ?, ?)",
-      ).run(payout.id, payout.mission_id, payout.provider_status, payout.status);
-    }
-
-    db.prepare("UPDATE missions SET status = 'approved' WHERE id = ?").run(mission.id);
-    return c.json({ mission_id: mission.id, status: "approved", ledger, payout }, 201);
+    return c.json({ mission_id: mission.id, status: "approved", ledger: result.ledger, payout: result.payout }, 201);
   });
 
   app.post("/payouts/:id/provider", async (c) => {
@@ -151,20 +214,7 @@ export function createApp(db: DatabaseSync) {
     const status = mapProviderStatus(providerStatus);
     if (status === "unknown") return c.json({ error: "status do provedor desconhecido" }, 400);
 
-    log({
-      level: 30,
-      msg: "provider.callback",
-      payout_id: payout.id,
-      mission_id: payout.mission_id,
-      provider_status: providerStatus,
-    });
-    db.prepare("UPDATE payouts SET provider_status = ?, status = ? WHERE id = ?").run(
-      providerStatus,
-      status,
-      payout.id,
-    );
-    log({ level: 30, msg: "payout.status", payout_id: payout.id, status });
-    return c.json({ id: payout.id, mission_id: payout.mission_id, provider_status: providerStatus, status });
+    return c.json(applyProviderStatus(db, payout, providerStatus, status));
   });
 
   return app;
