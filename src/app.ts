@@ -96,6 +96,32 @@ function creditInTransaction(db: DatabaseSync, mission: Mission, key: string): C
   return { kind: "credited", ledger, payout };
 }
 
+// Pago é terminal: o provedor reenvia eventos, e um PENDING ou FAILED atrasado
+// não desfaz um pagamento já confirmado. Devolve o repasse como ficou.
+function applyProviderStatus(
+  db: DatabaseSync,
+  payout: Payout,
+  providerStatus: string,
+  status: "paid" | "pending" | "failed",
+): Payout {
+  log({
+    level: 30,
+    msg: "provider.callback",
+    payout_id: payout.id,
+    mission_id: payout.mission_id,
+    provider_status: providerStatus,
+  });
+  const updated = db
+    .prepare("UPDATE payouts SET provider_status = ?, status = ? WHERE id = ? AND (status <> 'paid' OR ? = 'paid')")
+    .run(providerStatus, status, payout.id, status);
+  if (Number(updated.changes) === 0) {
+    log({ level: 40, msg: "payout.callback.ignored", payout_id: payout.id, provider_status: providerStatus });
+    return one<Payout>(db, "SELECT * FROM payouts WHERE id = ?", payout.id) ?? payout;
+  }
+  log({ level: 30, msg: "payout.status", payout_id: payout.id, status });
+  return { ...payout, provider_status: providerStatus, status };
+}
+
 export function createApp(db: DatabaseSync) {
   const app = new Hono();
 
@@ -182,30 +208,7 @@ export function createApp(db: DatabaseSync) {
     const status = mapProviderStatus(providerStatus);
     if (status === "unknown") return c.json({ error: "status do provedor desconhecido" }, 400);
 
-    log({
-      level: 30,
-      msg: "provider.callback",
-      payout_id: payout.id,
-      mission_id: payout.mission_id,
-      provider_status: providerStatus,
-    });
-    // Pago é terminal: o provedor reenvia eventos, e um PENDING ou FAILED atrasado
-    // não desfaz um pagamento já confirmado.
-    const updated = db
-      .prepare("UPDATE payouts SET provider_status = ?, status = ? WHERE id = ? AND (status <> 'paid' OR ? = 'paid')")
-      .run(providerStatus, status, payout.id, status);
-    if (Number(updated.changes) === 0) {
-      const current = one<Payout>(db, "SELECT * FROM payouts WHERE id = ?", payout.id) ?? payout;
-      log({ level: 40, msg: "payout.callback.ignored", payout_id: payout.id, provider_status: providerStatus });
-      return c.json({
-        id: current.id,
-        mission_id: current.mission_id,
-        provider_status: current.provider_status,
-        status: current.status,
-      });
-    }
-    log({ level: 30, msg: "payout.status", payout_id: payout.id, status });
-    return c.json({ id: payout.id, mission_id: payout.mission_id, provider_status: providerStatus, status });
+    return c.json(applyProviderStatus(db, payout, providerStatus, status));
   });
 
   return app;
