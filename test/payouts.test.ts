@@ -229,3 +229,29 @@ describe("integridade do crédito", () => {
     expect(done.ledger).toHaveLength(1);
   });
 });
+
+describe("data da aprovação", () => {
+  let app: App;
+
+  beforeEach(() => {
+    app = setup();
+  });
+
+  it("recusa data sem fuso, só o dia ou dia impossível, sem gravar crédito", async () => {
+    for (const approved_at of ["2026-03-12T22:02:00", "2026-03-12", "2026-02-30T12:00:00.000Z", "ontem"]) {
+      const res = await postJson(app, "/approvals", { mission_id: "msn_1842", approved_at, idempotency_key: `k_${approved_at}` });
+      expect([approved_at, res.status]).toEqual([approved_at, 400]);
+    }
+    const body = (await (await app.request("/missions/msn_1842")).json()) as { ledger: unknown[] };
+    expect(body.ledger).toHaveLength(0);
+  });
+
+  it("aceita offset explícito de São Paulo no último minuto do dia do prazo", async () => {
+    const res = await postJson(app, "/approvals", {
+      mission_id: "msn_1842",
+      approved_at: "2026-03-12T23:59:00-03:00",
+      idempotency_key: "pay_offset",
+    });
+    expect(res.status).toBe(201);
+  });
+});

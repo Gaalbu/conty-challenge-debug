@@ -1,6 +1,6 @@
 import type { DatabaseSync } from "node:sqlite";
 import { Hono } from "hono";
-import { approvedCivilDay, isPastDeadline } from "./deadlines.ts";
+import { approvedCivilDay, isPastDeadline, parseApprovedAt } from "./deadlines.ts";
 import { normalizeKey } from "./idempotency.ts";
 import { reaisFromCents } from "./money.ts";
 import { mapProviderStatus } from "./provider-status.ts";
@@ -64,8 +64,8 @@ export function createApp(db: DatabaseSync) {
     if (!missionId || !approvedAt || !key) {
       return c.json({ error: "missão, data de aprovação e chave são obrigatórias" }, 400);
     }
-    if (Number.isNaN(new Date(approvedAt).getTime())) {
-      return c.json({ error: "data de aprovação inválida" }, 400);
+    if (!parseApprovedAt(approvedAt)) {
+      return c.json({ error: "data de aprovação inválida: use ISO 8601 com fuso, ex. 2026-03-13T01:02:00.000Z" }, 400);
     }
 
     const mission = one<Mission>(db, "SELECT * FROM missions WHERE id = ?", missionId);
