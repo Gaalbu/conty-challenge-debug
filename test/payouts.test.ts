@@ -1,4 +1,8 @@
-import { beforeEach, describe, expect, it } from "vitest";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { createApp } from "../src/app.ts";
 import { openDatabase } from "../src/db.ts";
 import { seedIncident } from "../src/seed.ts";
@@ -253,5 +257,40 @@ describe("data da aprovação", () => {
       idempotency_key: "pay_offset",
     });
     expect(res.status).toBe(201);
+  });
+});
+
+describe("proteção no banco", () => {
+  it("o banco recusa um segundo lançamento da mesma missão mesmo fora da API", () => {
+    const db = openDatabase(":memory:");
+    seedIncident(db);
+    const insert = db.prepare("INSERT INTO ledger (id, mission_id, idempotency_key, amount_brl, created_at) VALUES (?, ?, ?, ?, ?)");
+    insert.run("l1", "msn_1842", "a", 150, "2026-03-12T15:00:00.000Z");
+    expect(() => insert.run("l2", "msn_1842", "b", 150, "2026-03-12T15:01:00.000Z")).toThrow(/UNIQUE/);
+    expect(() => insert.run("l3", "msn_1900", "a", 150, "2026-03-12T15:02:00.000Z")).toThrow(/UNIQUE/);
+  });
+
+  it("banco do incidente com duplicatas abre, avisa e não altera nenhuma linha", () => {
+    const dir = mkdtempSync(join(tmpdir(), "repasses-"));
+    const path = join(dir, "legacy.sqlite");
+    try {
+      const legacy = new DatabaseSync(path);
+      legacy.exec(`CREATE TABLE ledger (id TEXT PRIMARY KEY, mission_id TEXT NOT NULL, idempotency_key TEXT NOT NULL,
+        amount_brl REAL NOT NULL, created_at TEXT NOT NULL)`);
+      const insert = legacy.prepare("INSERT INTO ledger VALUES (?, ?, ?, ?, ?)");
+      insert.run("l1", "msn_1900", "pay_22a", 1.5, "2026-03-13T01:02:00.000Z");
+      insert.run("l2", "msn_1900", "pay_22a ", 1.5, "2026-03-13T01:02:05.000Z");
+      const before = legacy.prepare("SELECT * FROM ledger ORDER BY id").all();
+      legacy.close();
+
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      const db = openDatabase(path);
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining("ledger_one_per_mission"));
+      warn.mockRestore();
+      expect(db.prepare("SELECT * FROM ledger ORDER BY id").all()).toEqual(before);
+      db.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
