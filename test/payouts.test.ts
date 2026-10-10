@@ -193,4 +193,19 @@ describe("integridade do crédito", () => {
     const body = (await (await app.request("/missions/msn_1842")).json()) as { ledger: unknown[] };
     expect(body.ledger).toHaveLength(0);
   });
+
+  it("recusa com 409 a mesma chave reaproveitada em outra missão", async () => {
+    expect((await postJson(app, "/approvals", approval("msn_1842", "shared"))).status).toBe(201);
+    const res = await postJson(app, "/approvals", { ...approval("msn_1900", "shared"), approved_at: "2026-03-15T15:00:00.000Z" });
+    expect(res.status).toBe(409);
+    const other = (await (await app.request("/missions/msn_1900")).json()) as { ledger: unknown[] };
+    expect(other.ledger).toHaveLength(0);
+  });
+
+  it("não credita duas vezes a mesma missão aprovada com outra chave", async () => {
+    expect((await postJson(app, "/approvals", approval("msn_1842", "first"))).status).toBe(201);
+    expect((await postJson(app, "/approvals", approval("msn_1842", "second"))).status).toBe(200);
+    const body = (await (await app.request("/missions/msn_1842")).json()) as { ledger: unknown[] };
+    expect(body.ledger).toHaveLength(1);
+  });
 });

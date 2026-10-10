@@ -98,9 +98,14 @@ export function createApp(db: DatabaseSync) {
     }
 
     const existing = one<Ledger>(db, "SELECT * FROM ledger WHERE idempotency_key = ?", key);
-    if (existing) {
+    if (existing && existing.mission_id !== mission.id) {
+      return c.json({ error: "chave de idempotência já usada em outra missão" }, 409);
+    }
+    // A missão credita uma vez, mesmo que a segunda aprovação venha com outra chave.
+    const credited = existing ?? one<Ledger>(db, "SELECT * FROM ledger WHERE mission_id = ?", mission.id);
+    if (credited) {
       const payout = one<Payout>(db, "SELECT * FROM payouts WHERE mission_id = ?", mission.id) ?? null;
-      return c.json({ mission_id: mission.id, status: mission.status, ledger: existing, payout });
+      return c.json({ mission_id: mission.id, status: mission.status, ledger: credited, payout });
     }
 
     const ledger: Ledger = {
