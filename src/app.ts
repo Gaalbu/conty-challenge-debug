@@ -122,6 +122,23 @@ function applyProviderStatus(
   return { ...payout, provider_status: providerStatus, status };
 }
 
+type ApprovalInput = { missionId: string; approvedAt: string; rawKey: string; key: string };
+
+function parseApproval(body: unknown): ApprovalInput | { error: string } {
+  if (!body || typeof body !== "object") return { error: "corpo inválido" };
+  const record = body as Record<string, unknown>;
+  const missionId = typeof record.mission_id === "string" ? record.mission_id : "";
+  const approvedAt = typeof record.approved_at === "string" ? record.approved_at : "";
+  const rawKey = typeof record.idempotency_key === "string" ? record.idempotency_key : "";
+  // A chave é validada depois de normalizada: só espaço ou caractere invisível vira "".
+  const key = normalizeKey(rawKey);
+  if (!missionId || !approvedAt || !key) return { error: "missão, data de aprovação e chave são obrigatórias" };
+  if (!parseApprovedAt(approvedAt)) {
+    return { error: "data de aprovação inválida: use ISO 8601 com fuso, ex. 2026-03-13T01:02:00.000Z" };
+  }
+  return { missionId, approvedAt, rawKey, key };
+}
+
 export function createApp(db: DatabaseSync) {
   const app = new Hono();
 
@@ -136,20 +153,9 @@ export function createApp(db: DatabaseSync) {
   });
 
   app.post("/approvals", async (c) => {
-    const body = await c.req.json().catch(() => null);
-    if (!body || typeof body !== "object") return c.json({ error: "corpo inválido" }, 400);
-    const record = body as Record<string, unknown>;
-    const missionId = typeof record.mission_id === "string" ? record.mission_id : "";
-    const approvedAt = typeof record.approved_at === "string" ? record.approved_at : "";
-    const rawKey = typeof record.idempotency_key === "string" ? record.idempotency_key : "";
-    // A chave é validada depois de normalizada: só espaço ou caractere invisível vira "".
-    const key = normalizeKey(rawKey);
-    if (!missionId || !approvedAt || !key) {
-      return c.json({ error: "missão, data de aprovação e chave são obrigatórias" }, 400);
-    }
-    if (!parseApprovedAt(approvedAt)) {
-      return c.json({ error: "data de aprovação inválida: use ISO 8601 com fuso, ex. 2026-03-13T01:02:00.000Z" }, 400);
-    }
+    const input = parseApproval(await c.req.json().catch(() => null));
+    if ("error" in input) return c.json({ error: input.error }, 400);
+    const { missionId, approvedAt, rawKey, key } = input;
 
     const mission = one<Mission>(db, "SELECT * FROM missions WHERE id = ?", missionId);
     if (!mission) {
